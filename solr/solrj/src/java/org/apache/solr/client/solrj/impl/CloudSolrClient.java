@@ -1046,7 +1046,12 @@ public abstract class CloudSolrClient extends SolrClient {
     boolean isUpdate = false;
 
     if (request instanceof IsUpdateRequest) {
-      if (request instanceof UpdateRequest) {
+      sendToLeaders =
+          // nocommit: also check request.isSendToLeaders() (still to be added)
+          this.isUpdatesToLeaders();
+
+      // Check if we can do a "directUpdate" ...
+      if (sendToLeaders && request instanceof UpdateRequest) {
         isUpdate = true;
         if (inputCollections.size() > 1) {
           throw new SolrException(
@@ -1064,7 +1069,6 @@ public abstract class CloudSolrClient extends SolrClient {
           return response;
         }
       }
-      sendToLeaders = true;
     }
 
     SolrParams reqParams = request.getParams();
