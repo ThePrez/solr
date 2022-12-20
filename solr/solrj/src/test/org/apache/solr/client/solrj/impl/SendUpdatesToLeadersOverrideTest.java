@@ -23,9 +23,11 @@ import static org.hamcrest.Matchers.isIn;
 import static org.hamcrest.Matchers.not;
 
 import java.lang.invoke.MethodHandles;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -34,6 +36,8 @@ import org.apache.solr.client.solrj.request.CollectionAdminRequest;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.cloud.SolrCloudTestCase;
 import org.apache.solr.common.cloud.Replica;
+import org.apache.solr.request.SolrQueryRequest;
+import org.apache.solr.update.UpdateCommand;
 import org.apache.solr.update.processor.TrackingUpdateProcessorFactory;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -122,14 +126,41 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
         .collect(Collectors.toUnmodifiableList());
   }
 
+  /** Convinience class for making assertions about the updates that were processed */
   private static class RecordingResults {
-    public final List<String> preDistribCoreNames;
-    public final List<String> postDistribCoreNames;
+    public final List<UpdateCommand> preDistribCommands;
+    public final List<UpdateCommand> postDistribCommands;
+
+    public final Map<SolrQueryRequest, List<UpdateCommand>> preDistribRequests;
+    public final Map<SolrQueryRequest, List<UpdateCommand>> postDistribRequests;
+
+    public final Map<String, List<SolrQueryRequest>> preDistribCores;
+    public final Map<String, List<SolrQueryRequest>> postDistribCores;
+
+    private static Map<SolrQueryRequest, List<UpdateCommand>> mapReqsToCommands(
+        final List<UpdateCommand> commands) {
+      return commands.stream().collect(Collectors.groupingBy(UpdateCommand::getReq));
+    }
+
+    private static Map<String, List<SolrQueryRequest>> mapCoresToReqs(
+        final Collection<SolrQueryRequest> reqs) {
+      return reqs.stream()
+          .collect(
+              Collectors.groupingBy(
+                  r -> r.getContext().get(TrackingUpdateProcessorFactory.REQUEST_NODE).toString()));
+    }
 
     public RecordingResults(
-        final List<String> preDistribCoreNames, final List<String> postDistribCoreNames) {
-      this.preDistribCoreNames = preDistribCoreNames;
-      this.postDistribCoreNames = postDistribCoreNames;
+        final List<UpdateCommand> preDistribCommands,
+        final List<UpdateCommand> postDistribCommands) {
+      this.preDistribCommands = preDistribCommands;
+      this.postDistribCommands = postDistribCommands;
+
+      this.preDistribRequests = mapReqsToCommands(preDistribCommands);
+      this.postDistribRequests = mapReqsToCommands(postDistribCommands);
+
+      this.preDistribCores = mapCoresToReqs(preDistribRequests.keySet());
+      this.postDistribCores = mapCoresToReqs(postDistribRequests.keySet());
     }
   }
 
@@ -148,13 +179,15 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     assertEquals(0, req.process(client, COLLECTION_NAME).getStatus());
 
     final RecordingResults results =
-        new RecordingResults(stopRecording("pre-distrib"), stopRecording("post-distrib"));
+        new RecordingResults(
+            TrackingUpdateProcessorFactory.stopRecording("pre-distrib"),
+            TrackingUpdateProcessorFactory.stopRecording("post-distrib"));
 
     // post-distrib should never match any PULL replicas, regardless of request, if this fails
     // something is seriously wrong with our cluster
     assertThat(
         "post-distrib should never be PULL replica",
-        results.postDistribCoreNames,
+        results.postDistribCores.keySet(),
         everyItem(not(isIn(PULL_REPLICA_CORE_NAMES))));
 
     return results;
@@ -182,7 +215,6 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     }
   }
 
-  /** nocommit: This test will fail until bug is fixed */
   public void testUpdatesWithShardsPrefPull() throws Exception {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
@@ -209,44 +241,71 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
           assertUpdateWithRecording(new UpdateRequest().add(sdoc("id", "hoss")), client);
 
       // single NRT leader is only core that should be involved at all
-      assertThat("add pre-distrib size", add.preDistribCoreNames, hasSize(1));
+      assertThat("add pre-distrib size", add.preDistribCores.keySet(), hasSize(1));
+      assertThat("add pre-distrib size", add.preDistribRequests.keySet(), hasSize(1));
+      assertThat("add pre-distrib size", add.preDistribCommands, hasSize(1));
       assertThat(
           "add pre-distrib must be leader",
-          add.preDistribCoreNames,
+          add.preDistribCores.keySet(),
           everyItem(isIn(LEADER_CORE_NAMES)));
       assertEquals(
-          "add pre and post should match", add.preDistribCoreNames, add.postDistribCoreNames);
+          "add pre and post should match",
+          add.preDistribCores.keySet(),
+          add.postDistribCores.keySet());
+      assertEquals(
+          "add pre and post should be exact same reqs",
+          add.preDistribRequests.keySet(),
+          add.postDistribRequests.keySet());
+      // NOTE: we can't assert the pre/post commands are the same, because they add versioning
 
       // whatever leader our add was routed to, a DBI for the same id should go to the same leader
       final RecordingResults del =
           assertUpdateWithRecording(new UpdateRequest().deleteById("hoss"), client);
       assertEquals(
-          "del pre and post should match", add.preDistribCoreNames, add.postDistribCoreNames);
+          "del pre and post should match",
+          del.preDistribCores.keySet(),
+          del.postDistribCores.keySet());
       assertEquals(
           "add and del should have been routed the same",
-          add.preDistribCoreNames,
-          del.preDistribCoreNames);
+          add.preDistribCores.keySet(),
+          del.preDistribCores.keySet());
+      assertThat("del pre-distrib size", del.preDistribRequests.keySet(), hasSize(1));
+      assertThat("del pre-distrib size", del.preDistribCommands, hasSize(1));
     }
 
     { // DBQ should start on some leader, and then distrib to both leaders
       final RecordingResults record =
           assertUpdateWithRecording(new UpdateRequest().deleteByQuery("*:*"), client);
 
-      assertThat("dbq pre-distrib size", record.preDistribCoreNames, hasSize(1));
+      assertThat("dbq pre-distrib size", record.preDistribCores.keySet(), hasSize(1));
       assertThat(
           "dbq pre-distrib must be leader",
-          record.preDistribCoreNames,
+          record.preDistribCores.keySet(),
           everyItem(isIn(LEADER_CORE_NAMES)));
+      assertThat("dbq pre-distrib size", record.preDistribRequests.keySet(), hasSize(1));
+      assertThat("dbq pre-distrib size", record.preDistribCommands, hasSize(1));
 
       assertEquals(
           "dbq post-distrib must be all leaders",
           LEADER_CORE_NAMES,
-          new HashSet<>(record.postDistribCoreNames));
+          record.postDistribCores.keySet());
+      assertThat(
+          "dbq post-distrib size",
+          record.postDistribRequests.keySet(),
+          hasSize(LEADER_CORE_NAMES.size()));
+      assertThat(
+          "dbq post-distrib size", record.postDistribCommands, hasSize(LEADER_CORE_NAMES.size()));
     }
 
-    // nocommit: check an UpdateRequest with a mix of many doc adds DBIs, ...
-    // nocommit: confirm exactly 2 requests, one to each leader
+    { // When we have multiple direct updates for different shards, client will
+      // split them and merge the responses.
+      //
+      // But we should still only see at most one request per shard leader (pre and post)
 
+      // nocommit: check an UpdateRequest with a mix of many doc adds DBIs, ...
+      // nocommit: confirm no more then 2 pre-requests, one to each leader
+      // nocommit: confirm same pre and post requests
+    }
   }
 
   /**
@@ -264,53 +323,75 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
           assertUpdateWithRecording(prefPull(new UpdateRequest().add(sdoc("id", "hoss"))), client);
 
       // ...should start on (some) PULL replica, since we asked nicely
-      assertThat("add pre-distrib size", add.preDistribCoreNames, hasSize(1));
+      assertThat("add pre-distrib size", add.preDistribCores.keySet(), hasSize(1));
       assertThat(
           "add pre-distrib must be PULL",
-          add.preDistribCoreNames,
+          add.preDistribCores.keySet(),
           everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("add pre-distrib size", add.preDistribRequests.keySet(), hasSize(1));
+      assertThat("add pre-distrib size", add.preDistribCommands, hasSize(1));
 
       // ...then be routed to single leader for this id
-      assertThat("add post-distrib size", add.postDistribCoreNames, hasSize(1));
+      assertThat("add post-distrib size", add.postDistribCores.keySet(), hasSize(1));
       assertThat(
           "add post-distrib must be leader",
-          add.postDistribCoreNames,
+          add.postDistribCores.keySet(),
           everyItem(isIn(LEADER_CORE_NAMES)));
+      assertThat("add post-distrib size", add.postDistribRequests.keySet(), hasSize(1));
+      assertThat("add post-distrib size", add.postDistribCommands, hasSize(1));
 
       // A DBI should also start on (some) PULL replica,  since we asked nicely.
       //
-      // then it should be distributed to whaever leader our add doc (for the same id) was sent to
+      // then it should be distributed to whatever leader our add doc (for the same id) was sent to
       final RecordingResults del =
           assertUpdateWithRecording(prefPull(new UpdateRequest().deleteById("hoss")), client);
-      assertThat("del pre-distrib size", del.preDistribCoreNames, hasSize(1));
+      assertThat("del pre-distrib size", del.preDistribCores.keySet(), hasSize(1));
       assertThat(
           "del pre-distrib must be PULL",
-          del.preDistribCoreNames,
+          del.preDistribCores.keySet(),
           everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("del pre-distrib size", del.preDistribRequests.keySet(), hasSize(1));
+      assertThat("del pre-distrib size", del.preDistribCommands, hasSize(1));
+
       assertEquals(
           "add and del should have same post-distrib leader",
-          add.postDistribCoreNames,
-          del.postDistribCoreNames);
+          add.postDistribCores.keySet(),
+          del.postDistribCores.keySet());
+      assertThat("del post-distrib size", del.postDistribRequests.keySet(), hasSize(1));
+      assertThat("del post-distrib size", del.postDistribCommands, hasSize(1));
     }
 
     { // DBQ start on (some) PULL replica, since we asked nicely, then be routed to all leaders
       final RecordingResults record =
           assertUpdateWithRecording(prefPull(new UpdateRequest().deleteByQuery("*:*")), client);
 
-      assertThat("dbq pre-distrib size", record.preDistribCoreNames, hasSize(1));
+      assertThat("dbq pre-distrib size", record.preDistribCores.keySet(), hasSize(1));
       assertThat(
           "dbq pre-distrib must be PULL",
-          record.preDistribCoreNames,
+          record.preDistribCores.keySet(),
           everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("dbq pre-distrib size", record.preDistribRequests.keySet(), hasSize(1));
+      assertThat("dbq pre-distrib size", record.preDistribCommands, hasSize(1));
 
       assertEquals(
           "dbq post-distrib must be all leaders",
           LEADER_CORE_NAMES,
-          new HashSet<>(record.postDistribCoreNames));
+          record.postDistribCores.keySet());
+      assertThat(
+          "dbq post-distrib size",
+          record.postDistribRequests.keySet(),
+          hasSize(LEADER_CORE_NAMES.size()));
+      assertThat(
+          "dbq post-distrib size", record.postDistribCommands, hasSize(LEADER_CORE_NAMES.size()));
     }
 
-    // nocommit: check an UpdateRequest with a mix of many doc adds DBIs, ...
-    // nocommit: confirm we get exactly one request, no request splitting kicking in
+    { // When we have multiple direct updates for different shards, client will
+      // split them and merge the responses.
+      //
+      // But we should still only see at most one request per shard leader (pre and post)
 
+      // nocommit: check an UpdateRequest with a mix of many doc adds DBIs, ...
+      // nocommit: confirm we get exactly one pre request, no request splitting kicking in
+    }
   }
 }
