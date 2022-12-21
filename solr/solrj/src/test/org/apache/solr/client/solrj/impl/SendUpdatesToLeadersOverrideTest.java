@@ -219,7 +219,8 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
                 Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
-            // nocommit: builder name should never have been 'All', should have been 'Any'
+            // nocommit: builder name should never have been 'sendUpdatesToAllReplicasInShard'
+            // nocommit: - should have been 'sendUpdatesToAnyReplicas'
             .sendUpdatesToAllReplicasInShard()
             .build()) {
       checkUpdatesWithShardsPrefPull(client);
@@ -300,11 +301,35 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     { // When we have multiple direct updates for different shards, client will
       // split them and merge the responses.
       //
-      // But we should still only see at most one request per shard leader (pre and post)
+      // But we should still only see at most one pre request per shard leader
 
-      // nocommit: check an UpdateRequest with a mix of many doc adds DBIs, ...
-      // nocommit: confirm no more then 2 pre-requests, one to each leader
-      // nocommit: confirm same pre and post requests
+      final RecordingResults record =
+          assertUpdateWithRecording(prefPull(createMultiDirectUpdates(100, 10)), client);
+
+      // NOTE: Don't assume our docIds are spread across multi-shards...
+      // ...but the original number of requests should all be diff leaders
+      assertThat(
+          "multi pre-distrib must be leaders",
+          record.preDistribCores.keySet(),
+          everyItem(isIn(LEADER_CORE_NAMES)));
+      assertThat(
+          "multi pre-distrib req != pre-distrib num cores",
+          record.preDistribRequests.keySet(),
+          hasSize(record.preDistribCores.keySet().size()));
+      assertThat("multi pre-distrib command size", record.preDistribCommands, hasSize(100 + 10));
+
+      assertEquals(
+          "multi post-distrib must be same leaders",
+          record.preDistribCores.keySet(),
+          record.postDistribCores.keySet());
+
+      // NOTE: we make no asertion about number of post-distrb requests, just commands
+      // (distrib proc may batch differently then what we send)
+      assertEquals(
+          "multi post-distrib cores don't match pre-distrib cores",
+          record.preDistribCores.keySet(),
+          record.postDistribCores.keySet());
+      assertThat("multi post-distrib command size", record.postDistribCommands, hasSize(100 + 10));
     }
   }
 
@@ -385,13 +410,45 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
           "dbq post-distrib size", record.postDistribCommands, hasSize(LEADER_CORE_NAMES.size()));
     }
 
-    { // When we have multiple direct updates for different shards, client will
-      // split them and merge the responses.
-      //
-      // But we should still only see at most one request per shard leader (pre and post)
+    { // When we sendToLeaders is disabled, a single UpdateRequest containing multiple adds
+      // should still only go to one replica for all the "pre" commands, then be forwarded
+      // the respective leaders for the "post" commands
 
-      // nocommit: check an UpdateRequest with a mix of many doc adds DBIs, ...
-      // nocommit: confirm we get exactly one pre request, no request splitting kicking in
+      final RecordingResults record =
+          assertUpdateWithRecording(prefPull(createMultiDirectUpdates(100, 10)), client);
+
+      assertThat("multi pre-distrib size", record.preDistribCores.keySet(), hasSize(1));
+      assertThat(
+          "multi pre-distrib must be PULL",
+          record.preDistribCores.keySet(),
+          everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("multi pre-distrib req size", record.preDistribRequests.keySet(), hasSize(1));
+      assertThat("multi pre-distrib command size", record.preDistribCommands, hasSize(100 + 10));
+
+      assertEquals(
+          "multi post-distrib must be all leaders",
+          LEADER_CORE_NAMES,
+          record.postDistribCores.keySet());
+      // NOTE: Don't assume our docIds are spread across multi-shards...
+      //
+      // We make no asertion about number of post-distrb requests
+      // (distrib proc may batch differently then what we send)
+      assertThat(
+          "multi post-distrib cores",
+          record.postDistribCores.keySet(),
+          everyItem(isIn(LEADER_CORE_NAMES)));
+      assertThat("multi post-distrib command size", record.postDistribCommands, hasSize(100 + 10));
     }
+  }
+
+  private static UpdateRequest createMultiDirectUpdates(final int numAdds, final int numDel) {
+    final UpdateRequest req = new UpdateRequest();
+    for (int i = 0; i < numAdds; i++) {
+      req.add(sdoc("id", "add" + i));
+    }
+    for (int i = 0; i < numDel; i++) {
+      req.deleteById("del" + i);
+    }
+    return req;
   }
 }
