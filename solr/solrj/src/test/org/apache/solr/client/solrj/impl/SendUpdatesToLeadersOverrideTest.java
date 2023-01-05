@@ -32,6 +32,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.solr.client.solrj.SolrClient;
+import org.apache.solr.client.solrj.request.AbstractUpdateRequest;
 import org.apache.solr.client.solrj.request.CollectionAdminRequest;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.cloud.SolrCloudTestCase;
@@ -165,13 +166,13 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
   }
 
   /**
-   * Given an {@link UpdateRequest} and a {@link SolrClient}, processes that request against that
-   * client while {@link TrackingUpdateProcessorFactory} is recording, does some basic validation,
-   * then passes the recorded <code>pre-distrib</code> and <code>post-distrib</code> coreNames to
-   * the specified validators
+   * Given an {@link AbstractUpdateRequest} and a {@link SolrClient}, processes that request against
+   * that client while {@link TrackingUpdateProcessorFactory} is recording, does some basic
+   * validation, then passes the recorded <code>pre-distrib</code> and <code>post-distrib</code>
+   * coreNames to the specified validators
    */
   private static RecordingResults assertUpdateWithRecording(
-      final UpdateRequest req, final SolrClient client) throws Exception {
+      final AbstractUpdateRequest req, final SolrClient client) throws Exception {
 
     TrackingUpdateProcessorFactory.startRecording("pre-distrib");
     TrackingUpdateProcessorFactory.startRecording("post-distrib");
@@ -194,10 +195,11 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
   }
 
   /**
-   * Since {@link UpdateRequest#setParam} isn't a fluent API, this is a wrapper helper for setting
-   * <code>shards.preference=replica.type:PULL</code> on the input req, and then returning that req
+   * Since {@link AbstractUpdateRequest#setParam} isn't a fluent API, this is a wrapper helper for
+   * setting <code>shards.preference=replica.type:PULL</code> on the input req, and then returning
+   * that req
    */
-  private static UpdateRequest prefPull(final UpdateRequest req) {
+  private static AbstractUpdateRequest prefPull(final AbstractUpdateRequest req) {
     req.setParam("shards.preference", "replica.type:PULL");
     return req;
   }
@@ -205,17 +207,18 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
   // nocommit: - test CloudHttp2SolrClient as well
 
   // basic sanity check of expected default behavior
-  public void testUpdatesDefaultToLeaders() throws Exception {
+  public void testClientThatDefaultsToLeaders() throws Exception {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
                 Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
             .sendUpdatesOnlyToShardLeaders()
             .build()) {
       checkUpdatesDefaultToLeaders(client);
+      checkUpdatesWithSendToLeadersFalse(client);
     }
   }
 
-  public void testUpdatesWithShardsPrefPull() throws Exception {
+  public void testClientThatDoesNotDefaultToLeaders() throws Exception {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
                 Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
@@ -224,6 +227,7 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
             .sendUpdatesToAllReplicasInShard()
             .build()) {
       checkUpdatesWithShardsPrefPull(client);
+      checkUpdatesWithSendToLeadersFalse(client);
     }
   }
 
@@ -334,7 +338,7 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
   }
 
   /**
-   * Given a SolrClient, sends various updates using {#link #prefPull} and asserts expecations that
+   * Given a SolrClient, sends various updates using {@link #prefPull} and asserts expecations that
    * these requests will be initially sent to PULL replcias
    */
   private void checkUpdatesWithShardsPrefPull(final CloudSolrClient client) throws Exception {
@@ -416,6 +420,115 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
 
       final RecordingResults record =
           assertUpdateWithRecording(prefPull(createMultiDirectUpdates(100, 10)), client);
+
+      assertThat("multi pre-distrib size", record.preDistribCores.keySet(), hasSize(1));
+      assertThat(
+          "multi pre-distrib must be PULL",
+          record.preDistribCores.keySet(),
+          everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("multi pre-distrib req size", record.preDistribRequests.keySet(), hasSize(1));
+      assertThat("multi pre-distrib command size", record.preDistribCommands, hasSize(100 + 10));
+
+      assertEquals(
+          "multi post-distrib must be all leaders",
+          LEADER_CORE_NAMES,
+          record.postDistribCores.keySet());
+      // NOTE: Don't assume our docIds are spread across multi-shards...
+      //
+      // We make no asertion about number of post-distrb requests
+      // (distrib proc may batch differently then what we send)
+      assertThat(
+          "multi post-distrib cores",
+          record.postDistribCores.keySet(),
+          everyItem(isIn(LEADER_CORE_NAMES)));
+      assertThat("multi post-distrib command size", record.postDistribCommands, hasSize(100 + 10));
+    }
+  }
+
+  /**
+   * Given a SolrClient, sends various updates were {@link IsUpdateRequest#isSendToLeaders} returns
+   * false, and asserts expectations that requess using {@link #prefPull} are all sent to PULL
+   * replicas, regardless of how the client is configured.
+   */
+  private void checkUpdatesWithSendToLeadersFalse(final CloudSolrClient client) throws Exception {
+    { // single doc add...
+      final RecordingResults add =
+          assertUpdateWithRecording(
+              prefPull(new UpdateRequest().add(sdoc("id", "hoss"))).setSendToLeaders(false),
+              client);
+
+      // ...should start on (some) PULL replica, since we asked nicely
+      assertThat("add pre-distrib size", add.preDistribCores.keySet(), hasSize(1));
+      assertThat(
+          "add pre-distrib must be PULL",
+          add.preDistribCores.keySet(),
+          everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("add pre-distrib size", add.preDistribRequests.keySet(), hasSize(1));
+      assertThat("add pre-distrib size", add.preDistribCommands, hasSize(1));
+
+      // ...then be routed to single leader for this id
+      assertThat("add post-distrib size", add.postDistribCores.keySet(), hasSize(1));
+      assertThat(
+          "add post-distrib must be leader",
+          add.postDistribCores.keySet(),
+          everyItem(isIn(LEADER_CORE_NAMES)));
+      assertThat("add post-distrib size", add.postDistribRequests.keySet(), hasSize(1));
+      assertThat("add post-distrib size", add.postDistribCommands, hasSize(1));
+
+      // A DBI should also start on (some) PULL replica,  since we asked nicely.
+      //
+      // then it should be distributed to whatever leader our add doc (for the same id) was sent to
+      final RecordingResults del =
+          assertUpdateWithRecording(
+              prefPull(new UpdateRequest().deleteById("hoss")).setSendToLeaders(false), client);
+      assertThat("del pre-distrib size", del.preDistribCores.keySet(), hasSize(1));
+      assertThat(
+          "del pre-distrib must be PULL",
+          del.preDistribCores.keySet(),
+          everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("del pre-distrib size", del.preDistribRequests.keySet(), hasSize(1));
+      assertThat("del pre-distrib size", del.preDistribCommands, hasSize(1));
+
+      assertEquals(
+          "add and del should have same post-distrib leader",
+          add.postDistribCores.keySet(),
+          del.postDistribCores.keySet());
+      assertThat("del post-distrib size", del.postDistribRequests.keySet(), hasSize(1));
+      assertThat("del post-distrib size", del.postDistribCommands, hasSize(1));
+    }
+
+    { // DBQ start on (some) PULL replica, since we asked nicely, then be routed to all leaders
+      final RecordingResults record =
+          assertUpdateWithRecording(
+              prefPull(new UpdateRequest().deleteByQuery("*:*")).setSendToLeaders(false), client);
+
+      assertThat("dbq pre-distrib size", record.preDistribCores.keySet(), hasSize(1));
+      assertThat(
+          "dbq pre-distrib must be PULL",
+          record.preDistribCores.keySet(),
+          everyItem(isIn(PULL_REPLICA_CORE_NAMES)));
+      assertThat("dbq pre-distrib size", record.preDistribRequests.keySet(), hasSize(1));
+      assertThat("dbq pre-distrib size", record.preDistribCommands, hasSize(1));
+
+      assertEquals(
+          "dbq post-distrib must be all leaders",
+          LEADER_CORE_NAMES,
+          record.postDistribCores.keySet());
+      assertThat(
+          "dbq post-distrib size",
+          record.postDistribRequests.keySet(),
+          hasSize(LEADER_CORE_NAMES.size()));
+      assertThat(
+          "dbq post-distrib size", record.postDistribCommands, hasSize(LEADER_CORE_NAMES.size()));
+    }
+
+    { // When we sendToLeaders is disabled, a single UpdateRequest containing multiple adds
+      // should still only go to one replica for all the "pre" commands, then be forwarded
+      // the respective leaders for the "post" commands
+
+      final RecordingResults record =
+          assertUpdateWithRecording(
+              prefPull(createMultiDirectUpdates(100, 10)).setSendToLeaders(false), client);
 
       assertThat("multi pre-distrib size", record.preDistribCores.keySet(), hasSize(1));
       assertThat(
