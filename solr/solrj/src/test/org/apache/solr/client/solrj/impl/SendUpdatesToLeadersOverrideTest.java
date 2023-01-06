@@ -34,6 +34,7 @@ import java.util.stream.Collectors;
 import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.request.AbstractUpdateRequest;
 import org.apache.solr.client.solrj.request.CollectionAdminRequest;
+import org.apache.solr.client.solrj.request.IsUpdateRequest;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.cloud.SolrCloudTestCase;
 import org.apache.solr.common.cloud.Replica;
@@ -46,9 +47,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Test the behavior of {@link CloudSolrClient#isUpdatesToLeaders}
+ * Test the behavior of {@link CloudSolrClient#isUpdatesToLeaders} and {@link
+ * IsUpdateRequest#isSendToLeaders}.
  *
- * <p>nocommit: more explanation of how we test this
+ * <p>This class uses {@link TrackingUpdateProcessorFactory} instances (configured both before, and
+ * after the <code>distrib</code> processor) to inspect which replicas recieve various {@link
+ * UpdateRequest}s from variously configured {@link CloudSolrClient}s. In some requests, <code>
+ * shards.preference=replica.type:PULL</code> is specified to confirm that typical routing
+ * prefrences are respected (when the effective value of <code>isSendToLeaders</code> is <code>false
+ * </code>)
  */
 public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
 
@@ -204,10 +211,22 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     return req;
   }
 
-  // nocommit: - test CloudHttp2SolrClient as well
+  public void testBuilderImplicitBehavior() throws Exception {
+    try (CloudSolrClient client =
+        new CloudLegacySolrClient.Builder(
+                Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
+            .build()) {
+      assertTrue(client.isUpdatesToLeaders());
+    }
+    try (CloudSolrClient client =
+        new CloudHttp2SolrClient.Builder(
+                Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
+            .build()) {
+      assertTrue(client.isUpdatesToLeaders());
+    }
+  }
 
-  // basic sanity check of expected default behavior
-  public void testClientThatDefaultsToLeaders() throws Exception {
+  public void testLegacyClientThatDefaultsToLeaders() throws Exception {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
                 Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
@@ -218,9 +237,31 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     }
   }
 
-  public void testClientThatDoesNotDefaultToLeaders() throws Exception {
+  public void testLegacyClientThatDoesNotDefaultToLeaders() throws Exception {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
+                Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
+            .sendUpdatesToAnyReplica()
+            .build()) {
+      checkUpdatesWithShardsPrefPull(client);
+      checkUpdatesWithSendToLeadersFalse(client);
+    }
+  }
+
+  public void testHttp2ClientThatDefaultsToLeaders() throws Exception {
+    try (CloudSolrClient client =
+        new CloudHttp2SolrClient.Builder(
+                Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
+            .sendUpdatesOnlyToShardLeaders()
+            .build()) {
+      checkUpdatesDefaultToLeaders(client);
+      checkUpdatesWithSendToLeadersFalse(client);
+    }
+  }
+
+  public void testHttp2ClientThatDoesNotDefaultToLeaders() throws Exception {
+    try (CloudSolrClient client =
+        new CloudHttp2SolrClient.Builder(
                 Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
             .sendUpdatesToAnyReplica()
             .build()) {
