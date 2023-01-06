@@ -136,7 +136,7 @@ public class CloudHttp2SolrClient extends CloudSolrClient {
     protected List<String> solrUrls = new ArrayList<>();
     protected String zkChroot;
     protected Http2SolrClient httpClient;
-    protected boolean shardLeadersOnly = true;
+    protected boolean shardLeadersOnly = true; // nocommit: use this, add setter
     protected boolean directUpdatesToLeadersOnly = false;
     protected boolean parallelUpdates = true;
     protected ClusterStateProvider stateProvider;

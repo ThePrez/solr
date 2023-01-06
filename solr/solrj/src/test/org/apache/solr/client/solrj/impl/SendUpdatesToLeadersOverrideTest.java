@@ -222,9 +222,7 @@ public class SendUpdatesToLeadersOverrideTest extends SolrCloudTestCase {
     try (CloudSolrClient client =
         new CloudLegacySolrClient.Builder(
                 Collections.singletonList(cluster.getZkServer().getZkAddress()), Optional.empty())
-            // nocommit: builder name should never have been 'sendUpdatesToAllReplicasInShard'
-            // nocommit: - should have been 'sendUpdatesToAnyReplicas'
-            .sendUpdatesToAllReplicasInShard()
+            .sendUpdatesToAnyReplica()
             .build()) {
       checkUpdatesWithShardsPrefPull(client);
       checkUpdatesWithSendToLeadersFalse(client);
